@@ -1,0 +1,34 @@
+**Task Decomposition & Intake — Build Notes**
+
+**The intake agent** Sits above the blueprint orchestration. Receives tasks from entry points (Slack, CLI, ticketing system) and is responsible for qualifying and routing them before anything spins up. This is itself an agentic step — it requires reasoning about the task.
+
+**What the intake agent does**
+
+1. Receives the task
+2. Classifies it — is this agent-suitable or does it go back to a human
+3. Scopes it — defines the boundaries of the work
+4. Identifies file ownership — what parts of the codebase will be touched
+5. Checks for conflicts — is anything else currently working in that space
+6. Hands off to the blueprint orchestration if it passes
+
+**Task classification criteria** Agent-suitable tasks are:
+
+- Well defined with clear success criteria
+- Bounded — don't touch too many parts of the codebase
+- Non-architectural — no design decisions required
+- Have deterministic validation — tests and linters can confirm correctness
+
+Tasks that fail classification go back to a human, not into the queue.
+
+**File ownership and conflict prevention** Before any agent spins up, file ownership is registered. No two agents can own the same file simultaneously. This is the critical gate — without it downstream conflicts are guaranteed.
+
+**The task queue** Qualified tasks sit in a queue (SQS fits naturally here) waiting for a devbox to claim them. The queue is the buffer between intake and execution.
+
+```
+Entry points (Slack, CLI, tickets)
+    → Intake agent (classify, scope, assign file ownership)
+    → SQS queue (qualified tasks only)
+    → Blueprint orchestration (execution)
+```
+
+**Key principle** Minions is code maintenance automation not general coding. The intake agent is the enforcer of that boundary. Anything resembling feature work, architecture, or ambiguous requirements gets rejected back to a human.
