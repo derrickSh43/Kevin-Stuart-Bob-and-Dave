@@ -1,0 +1,393 @@
+**Minion Blueprint, Scaling Controller & Lifecycle — Build Notes**
+
+---
+
+**Overview** Step Functions executions are fully ephemeral. Each one starts, runs a task, and ends. All scaling and lifecycle control happens in a dedicated Lambda controller. Executions self report completion. Controller cleanup is a safety net only.
+
+---
+
+**Scaling Controller Lambda**
+
+Runs on EventBridge schedule every 60 seconds. Stateless — every invocation makes a fresh decision. Cleanup always runs before spin up.
+
+python
+
+```python
+def scaling_controller():
+    # Job 1 - cleanup first
+    active = get_active_executions()
+    
+    for execution in active:
+        if is_complete(execution):
+            ensure_devbox_destroyed(execution)
+        elif is_stuck(execution):
+            force_stop(execution)
+            destroy_devbox(execution)
+            dead_letter(execution.task)
+    
+    # Job 2 - spin up
+    active_count = get_active_execution_count()
+    
+    allowed = min(
+        ec2_pool_available,
+        inference_rate_headroom,
+        budget_headroom,
+        max_concurrency_hard_limit
+    )
+    
+    can_start = allowed - active_count
+    
+    if can_start > 0:
+        messages = pull_messages(sqs, count=can_start)
+        for message in messages:
+            trigger_step_functions(message)
+```
+
+**Scaling controller inputs**
+
+- SQS queue depth
+- Active Step Functions execution count
+- Available pre-warmed EC2 pool size
+- Current spend rate
+- Inference API rate limit headroom
+
+**Max execution age**
+
+python
+
+```python
+MAX_EXECUTION_AGE = 30  # minutes
+
+for execution in active_executions:
+    age = now - execution.start_time
+    if age > MAX_EXECUTION_AGE:
+        force_stop(execution)
+        destroy_devbox(execution.devbox_id)
+        dead_letter(execution.task)
+```
+
+**Scale down behavior** No running executions are touched. Controller pulls fewer messages on next invocation. Active executions finish naturally and self report completion.
+
+**Cost** ~43,000 Lambda invocations per month. Essentially free.
+
+---
+
+**Step Functions State Machine**
+
+json
+
+```json
+{
+  "Comment": "Minion Agent Blueprint",
+  "StartAt": "SpinUpDevbox",
+  "States": {
+
+    "SpinUpDevbox": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:SpinUpDevboxFunction",
+      "Next": "CloneRepo",
+      "Catch": [{
+        "ErrorEquals": ["DevboxFailed"],
+        "Next": "DeadLetterEscalate"
+      }]
+    },
+
+    "CloneRepo": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:CloneRepoFunction",
+      "Next": "LoadRuleFiles",
+      "Catch": [{
+        "ErrorEquals": ["CloneFailed"],
+        "Next": "DestroyDevbox"
+      }]
+    },
+
+    "LoadRuleFiles": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:LoadRuleFilesFunction",
+      "Next": "Implement",
+      "Catch": [{
+        "ErrorEquals": ["RuleLoadFailed"],
+        "Next": "DestroyDevbox"
+      }]
+    },
+
+    "Implement": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:ImplementFunction",
+      "Next": "EvalOutput",
+      "Retry": [{
+        "ErrorEquals": ["MalformedOutput"],
+        "MaxAttempts": 1
+      }],
+      "Catch": [{
+        "ErrorEquals": ["ImplementFailed"],
+        "Next": "EscalateToHuman"
+      }]
+    },
+
+    "EvalOutput": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:EvalOutputFunction",
+      "Next": "RunLinter",
+      "Retry": [{
+        "ErrorEquals": ["LowQuality"],
+        "MaxAttempts": 1,
+        "Next": "Implement"
+      }],
+      "Catch": [{
+        "ErrorEquals": ["EvalFailed"],
+        "Next": "EscalateToHuman"
+      }]
+    },
+
+    "RunLinter": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:RunLinterFunction",
+      "Next": "AutoFixLint",
+      "Catch": [{
+        "ErrorEquals": ["LintFailed"],
+        "Next": "AutoFixLint"
+      }]
+    },
+
+    "AutoFixLint": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:AutoFixLintFunction",
+      "Next": "PushBranch",
+      "Retry": [{
+        "ErrorEquals": ["FixFailed"],
+        "MaxAttempts": 1
+      }],
+      "Catch": [{
+        "ErrorEquals": ["CannotFix"],
+        "Next": "EscalateToHuman"
+      }]
+    },
+
+    "PushBranch": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:PushBranchFunction",
+      "Next": "AddToMergeQueue",
+      "Catch": [{
+        "ErrorEquals": ["PushFailed"],
+        "Next": "EscalateToHuman"
+      }]
+    },
+
+    "AddToMergeQueue": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:AddToMergeQueueFunction",
+      "Next": "WaitForCIResult",
+      "Catch": [{
+        "ErrorEquals": ["ConflictDetected"],
+        "Next": "EscalateToHuman"
+      }]
+    },
+
+    "WaitForCIResult": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:WaitForCIResultFunction",
+      "Next": "CIResultRouter",
+      "Comment": "EventBridge pushes CI result, no polling"
+    },
+
+    "CIResultRouter": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ciStatus",
+          "StringEquals": "passed",
+          "Next": "CreatePR"
+        },
+        {
+          "Variable": "$.ciStatus",
+          "StringEquals": "failed",
+          "Next": "CheckCIRetryCount"
+        }
+      ]
+    },
+
+    "CheckCIRetryCount": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.ciRetryCount",
+          "NumericLessThan": 2,
+          "Next": "FixCIFailure"
+        }
+      ],
+      "Default": "EscalateToHuman"
+    },
+
+    "FixCIFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:FixCIFailureFunction",
+      "Next": "PushBranch",
+      "Catch": [{
+        "ErrorEquals": ["FixFailed"],
+        "Next": "EscalateToHuman"
+      }]
+    },
+
+    "CreatePR": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:CreatePRFunction",
+      "Next": "DestroyDevbox",
+      "Catch": [{
+        "ErrorEquals": ["PRFailed"],
+        "Next": "EscalateToHuman"
+      }]
+    },
+
+    "EscalateToHuman": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:EscalateToHumanFunction",
+      "Next": "DestroyDevbox"
+    },
+
+    "DeadLetterEscalate": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:DeadLetterFunction",
+      "Next": "DestroyDevbox"
+    },
+
+    "DestroyDevbox": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:DestroyDevboxFunction",
+      "Next": "SignalComplete"
+    },
+
+    "SignalComplete": {
+      "Type": "Task",
+      "Resource": "arn:aws:lambda:...:SignalCompleteFunction",
+      "End": true
+    }
+
+  }
+}
+```
+
+---
+
+**SignalComplete Lambda**
+
+Last step in every execution path. Self reports completion so controller does not need to do cleanup on the happy path.
+
+python
+
+```python
+def signal_complete(event):
+    execution_id = event['execution_id']
+    
+    # 1. confirm devbox is gone
+    verify_devbox_destroyed(event['devbox_id'])
+    
+    # 2. release file ownership locks
+    release_file_locks(event['task_id'])
+    
+    # 3. signal controller
+    decrement_active_count(execution_id)
+```
+
+---
+
+**Execution paths**
+
+Every path ends at DestroyDevbox → SignalComplete without exception.
+
+```
+Success path
+    SpinUpDevbox → CloneRepo → LoadRuleFiles → Implement
+    → EvalOutput → RunLinter → AutoFixLint → PushBranch
+    → AddToMergeQueue → WaitForCIResult → CreatePR
+    → DestroyDevbox → SignalComplete
+
+Escalation path (partial work exists)
+    → EscalateToHuman → DestroyDevbox → SignalComplete
+
+Infrastructure failure path
+    → DeadLetterEscalate → DestroyDevbox → SignalComplete
+```
+
+---
+
+**Inference step limits**
+
+|Step|Max attempts|On failure|
+|---|---|---|
+|Implement|2|Escalate|
+|EvalOutput|2|Escalate|
+|FixCIFailure|2 total CI rounds|Escalate|
+
+---
+
+**Escalation vs dead letter**
+
+- **EscalateToHuman** — agent did useful work, got stuck, partial branch handed to human as starting point
+- **DeadLetterEscalate** — infrastructure broke, task goes back to DLQ for retry or manual handling
+
+---
+
+**Branch hierarchy**
+
+```
+main (production)
+    ↑ manual human promotion only
+
+dev/testing
+    ↑ human verification gate
+
+ghost (ephemeral, created on demand)
+    ↑ automated promotion on passing threshold
+    ↑ destroyed after promotion attempt
+
+agent branches
+    ↑ merge queue picks up, tests against ghost
+```
+
+**Ghost branch lifecycle**
+
+```
+Trigger (queue limit or time window)
+    → create ghost from dev/testing
+    → check conflicts via get_merge_conflicts()
+    → speculatively merge queued PRs in order
+    → CI runs against ghost
+    → if passes → squash to dev/testing, destroy ghost
+    → if fails → remove bad PR, rerun remaining
+    → ghost destroyed either way
+```
+
+**Ghost trigger rules**
+
+- Queue depth hits batch limit → create ghost, process batch
+- Time window expires → create ghost, process whatever is queued
+- Whichever comes first
+
+**CodeCommit operations used**
+
+python
+
+```python
+codecommit.get_merge_conflicts()
+codecommit.merge_branches_by_squash()
+codecommit.merge_pull_request_by_squash()
+codecommit.create_pull_request()
+codecommit.get_pull_request()
+codecommit.update_pull_request_status()
+```
+
+---
+
+**Key principles**
+
+- Step Functions executions are fully ephemeral
+- Scaling controller is the only thing managing concurrency
+- Executions self report completion via SignalComplete
+- Controller cleanup is safety net for stuck or orphaned executions only
+- DestroyDevbox → SignalComplete always runs regardless of outcome
+- CI result pushed via EventBridge, never polled
+- All inference steps hard bounded, no open ended loops
+- EscalateToHuman preserves partial work
+- DeadLetterEscalate handles infrastructure failures
