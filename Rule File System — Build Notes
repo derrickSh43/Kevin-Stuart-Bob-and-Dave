@@ -1,0 +1,34 @@
+**Rule File System — Build Notes**
+
+**File structure**
+
+```
+repo-root/
+├── .rules.md          ← minimal global baseline
+├── payments/
+│   └── .rules.md
+├── billing/
+│   └── .rules.md
+│   └── subscriptions/
+│       └── .rules.md
+```
+
+**How rules are loaded** Walk up the directory tree from the file being worked on, collect every `.rules.md` found, concatenate root-first, inject into agent context. ~30-50 lines of code.
+
+python
+
+```python
+def collect_rules(file_path, repo_root):
+    rules = []
+    path = Path(file_path).parent
+    while True:
+        rule_file = path / ".rules.md"
+        if rule_file.exists():
+            rules.append(rule_file.read_text())
+        if path == repo_root:
+            break
+        path = path.parent
+    return "\n\n".join(reversed(rules))
+```
+
+**Storage** AWS CodeCommit. VPC-internal, IAM auth, no egress fees. Cloned onto the EC2 devbox at run start. Devbox is destroyed after the run. CodeCommit is the permanent source of truth.****
